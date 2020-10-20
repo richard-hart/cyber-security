@@ -1,0 +1,95 @@
+
+# Author: Richard Hart
+# Date: 28/02/19
+# Prerequisites - ensure that you have the Azure AD PowerShell Module installed: https://docs.microsoft.com/en-us/powershell/azure/active-directory/install-adv2?view=azureadps-2.0
+
+# Let's get some admin credentials
+$adminCredential = Get-Credential
+
+# Let's connect to some services
+Connect-MsolService -Credential $adminCredential
+Connect-AzureAD -Credential $adminCredential
+
+# Let's connect to Exchange Online Remote Powershell Service
+$ExoSession = New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri https://outlook.office365.com/powershell-liveid/ -Credential $adminCredential -Authentication Basic -AllowRedirection
+Import-PSSession $ExoSession
+
+# Let's connect to EOP Powershell Service
+$EopSession = New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri https://ps.compliance.protection.outlook.com/powershell-liveid/ -Credential $adminCredential -Authentication Basic -AllowRedirection
+Import-PSSession $EopSession -AllowClobber
+
+# Let's import some modules
+Import-Module MSOnline
+
+# Let's get the UPN of the compromised user
+$upn = "john@acme.com"
+
+# Let's disable the Office 365 account
+Set-MsolUser -UserPrincipalName $upn -blockcredential $True
+
+# Let's disable remote powershell for the compromised user
+Set-User -Identity $upn -RemotePowerShellEnabled $false
+
+# Let’s Disable SMTP authenticated submission to prevent relaying mail via 365 using PowerShell or similar
+Set-CASMailbox $upn -SmtpClientAuthenticationDisabled $true
+
+# Let's change the user's password
+Add-Type -AssemblyName System.web
+$newPassword = ([System.Web.Security.Membership]::GeneratePassword(16,2))
+Set-MsolUserPassword –UserPrincipalName $upn –NewPassword $newPassword -ForceChangePassword $True
+Set-MsolUser -UserPrincipalName $upn -StrongPasswordRequired $True
+
+# Let's identify the LastDirSyncTime and LastPasswordChangeTimestamp value to ensure that the password change has also been synchronized to Azure AD.
+# Make sure that, if the user changed their password in the on-premises directory, the password synchronization has taken place.
+# If the LastDirSyncTime value is not after the LastPasswordChangeTimestamp value, log on to the DIR Sync or Azure AD Connect server and start a delta sync
+Get-MsolUser -UserPrincipalName $upn | select LastDirSyncTime,LastPasswordChangeTimestamp
+
+# Let's kill all active user sessions in any Azure AD application
+Get-AzureADUser -ObjectId $upn | Revoke-AzureADUserAllRefreshToken
+or
+Revoke-AzureADUserAllRefreshToken -ObjectId $upn
+
+# Let's list all mail forwarding rules to external domains for the affected user
+Get-InboxRule -Mailbox $upn | Select Name, Description, Enabled, Priority, ForwardTo, ForwardAsAttachmentTo, RedirectTo, DeleteMessage, SendTextMessageNotificationTo | Where-Object {(($_.Enabled -eq $true) -and (($_.ForwardTo -ne $null) -or ($_.ForwardAsAttachmentTo -ne $null) -or ($_.RedirectTo -ne $null) -or ($_.SendTextMessageNotificationTo -ne $null)))} | Format-Table
+
+# Let's disable all mail forwarding rules to external domains for the affected user
+Get-InboxRule -Mailbox $upn | Where-Object {(($_.Enabled -eq $true) -and (($_.ForwardTo -ne $null) -or ($_.ForwardAsAttachmentTo -ne $null) -or ($_.RedirectTo -ne $null) -or ($_.SendTextMessageNotificationTo -ne $null)))} | Disable-InboxRule -Confirm:$false
+
+# Let's clean-up any disabled mail forwarding rules
+Get-InboxRule -Mailbox $upn | Where-Object {((($_.ForwardTo -ne $null) -or ($_.ForwardAsAttachmentTo -ne $null) -or ($_.RedirectTo -ne $null) -or ($_.SendTextMessageNotificationTo -ne $null)))} | Remove-InboxRule -Confirm:$false
+
+# Let's list the current Mailbox Forwarding configuration for the affected user
+Get-Mailbox -Identity $upn | Select Name, DeliverToMailboxAndForward, ForwardingSmtpAddress
+
+# Let's disable all Mailbox Forwarding configurations for the affected user
+Set-Mailbox -Identity $upn -DeliverToMailboxAndForward $false -ForwardingSmtpAddress $null
+
+# Let's enable mailbox auditing for the affected user
+Set-Mailbox $upn -AuditEnabled $true -AuditLogAgeLimit 90
+
+# List the current configuration for auditing
+Get-Mailbox -Identity $upn | Select Name, AuditEnabled, AuditLogAgeLimit
+
+# Let's list all the Mailbox Delegate Permissions for the affected user
+$mailboxDelegates = Get-MailboxPermission -Identity $upn | Where-Object {($_.IsInherited -ne "True") -and ($_.User -notlike "*SELF*")}
+$mailboxDelegates | fl
+
+# Let's remove Mailbox Delegate Permissions for the affected user
+Get-MailboxPermission -Identity $upn | Where-Object {($_.IsInherited -ne "True") -and ($_.User -notlike "*SELF*")}
+    foreach ($delegate in $mailboxDelegates) 
+    {
+        Remove-MailboxPermission -Identity $upn -User $delegate.User -AccessRights $delegate.AccessRights -InheritanceType All -Confirm:$false
+    }
+
+# Let's download the mailbox audit logs
+$userName = $upn -split "@"
+$auditLogPath = ".\" + $userName[0] + "AuditLog" + (Get-Date).ToString('yyyy-MM-dd') + ".csv"  
+$startDate = (Get-Date).AddDays(-7).ToString('MM/dd/yyyy')
+$endDate = (Get-Date).ToString('MM/dd/yyyy')
+$results = Search-UnifiedAuditLog -StartDate $startDate -EndDate $endDate -UserIds $upn
+$results | Export-Csv -Path $auditLogPath
+
+# Let's review the audit logs to ensure that we have captured everything
+$results | Format-Table    
+	
+# All done!
